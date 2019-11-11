@@ -13,8 +13,9 @@
 #include "debug.h"
 
 #define BUFSIZE 512
-#define CMDSIZE 4
+#define CMDSIZE 5
 #define PARSIZE 100
+#define UINT16_MAX 65535
 
 #define MSG_220 "220 srvFtp version 1.0\r\n"
 #define MSG_331 "331 Password required for %s\r\n"
@@ -152,6 +153,7 @@ void retr(int sd, char *file_path) {
         bzero(buffer, BUFSIZE);
     }
     // close the file
+    sleep(1);
     fclose(file);
     // send a completed transfer message
     send_ans(sd, MSG_226);
@@ -258,7 +260,7 @@ bool authenticate(int sd) {
  **/
 
 void operate(int sd) {
-    char op[CMDSIZE + 1], param[PARSIZE];
+    char op[CMDSIZE], param[PARSIZE];
 
     while (true) {
         op[0] = param[0] = '\0';

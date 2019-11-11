@@ -12,6 +12,7 @@
 #include "debug.h"
 
 #define BUFSIZE 512
+#define UINT16_MAX 65535
 
 int get_digits(char *string) {
     char *ptr = string;
