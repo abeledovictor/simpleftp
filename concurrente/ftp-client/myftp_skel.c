@@ -8,18 +8,21 @@
 #include <err.h>
 
 #include <netinet/in.h>
+#include <netdb.h>
 #include <arpa/inet.h>
 #include "debug.h"
 
 #define BUFSIZE 512
 #define UINT16_MAX 65535
+#define BACKLOG 10
+
+#define MSG_550 "550 %s: no such file or directory\r\n"
 
 int get_digits(char *string) {
     char *ptr = string;
     while (*ptr) {
         if (isdigit(*ptr)) {
             long val = strtol(ptr, &ptr, 10);
-            DEBUG_PRINT(("get_digits VAL %ld\n", val));
             return (int) val;
         } else {
             ptr++;
@@ -138,69 +141,72 @@ void authenticate(int sd) {
 
 }
 
+void put(int sd, int datasd, char *file_name) {
+    char desc[BUFSIZE], buffer[BUFSIZE];
+    int f_size, recv_s, r_size = BUFSIZE;
+    int bread;
+    FILE *file;
+
+    if ((file = fopen(file_name, "r")) == NULL) {
+        printf(MSG_550, file_name);
+        return;
+    }
+
+    send_msg(sd, "STOR", file_name);
+    
+    recv_msg(sd, 200, NULL);
+
+    recv_msg(sd, 150, NULL);
+ 
+    while(1) {
+        bread = fread(buffer, 1, BUFSIZE, file);
+        if (bread > 0) {
+            send(datasd, buffer, bread, 0);
+            sleep(1);
+        }
+        if (bread < BUFSIZE) break;
+    }
+    
+    fclose(file);
+
+    recv_msg(sd, 226, NULL);
+}
+
 /**
  * function: operation get
  * sd: socket descriptor
  * file_name: file name to get from the server
  **/
-void get(int sd, char *file_name) {
-    char desc[BUFSIZE], buffer[BUFSIZE], revbuf[BUFSIZE];
+void get(int sd, int server_sd, char *file_name) {
+    char desc[BUFSIZE], buffer[BUFSIZE];
     int f_size, recv_s, r_size = BUFSIZE;
     FILE *file;
-
+    ssize_t bytes_read;
+    ssize_t escritos = 0;
+    
     // send the RETR command to the server
-    send_msg(sd, "RETR", file_name);
+    send_msg(sd,"RETR",file_name);
     // check for the response
-    if(!recv_msg(sd, 299, desc))
-    {
-        warn("299 message not received from server\n");
-        return;
+    if(recv_msg(sd,150,buffer)){
+        // parsing the file size from the answer received
+        f_size = get_digits(buffer);
+        
+        // open the file to write
+        file = fopen(file_name, "w"); 
+              
+        while(escritos < f_size){
+            bytes_read = read(server_sd,desc,BUFSIZE);
+            escritos = escritos + bytes_read;
+            fwrite(desc, sizeof(char), bytes_read, file);
+        }
+        
+        // close the file
+        fclose(file);
+        close(server_sd);
+
+        // receive the OK from the server
+        recv_msg(sd,226,NULL);
     }
-    // parsing the file size from the answer received
-    // "File %s size %ld bytes"
-    f_size = get_digits(desc);
-
-    // open the file to write
-    file = fopen(file_name, "w+");
-
-    //receive the file
-    bzero(revbuf, BUFSIZE);
-    int f_block_sz = 0;
-    recv_s = 0;
-    while(f_block_sz = recv(sd, revbuf, BUFSIZE, 0))
-    {
-        DEBUG_PRINT(("recv_s: %d f_block_sz: %d\n", recv_s, f_block_sz));  
-        recv_s = f_block_sz + recv_s;
-
-        if(f_block_sz < 0)
-        {
-            printf("Receive file error.\n");
-            bzero(revbuf, BUFSIZE);
-            break;
-        }
-        int write_sz = fwrite(revbuf, sizeof(char), f_block_sz, file);
-        DEBUG_PRINT(("write_sz: %d\n", write_sz));
-        if(write_sz < f_block_sz)
-        {
-            printf("File write failed.\n");
-            bzero(revbuf, BUFSIZE);
-            break;
-        }
-        bzero(revbuf, BUFSIZE);
-        DEBUG_PRINT(("RECV_S: %d F_SIZE: %d\n",recv_s, f_size));
-        if(recv_s == f_size)
-        {
-            break;
-        }
-    }
-    DEBUG_PRINT(("Sucessfull file transfer!\n"));
-
-    // close the file
-    fclose(file);
-
-    // receive the OK from the server
-    recv_msg(sd, 226, NULL);
-
 }
 
 /**
@@ -215,13 +221,13 @@ void quit(int sd) {
 }
 
 /**
- * function: make all operations (get|quit)
+ * function: make all operations (get|quit|put)
  * sd: socket descriptor
  **/
-void operate(int sd) {
+void operate(int sd, int server_sd) {
     char *input, *op, *param;
 
-    while (true) {
+    while(true) {
         printf("Operation: ");
         input = read_input();
         if (input == NULL)
@@ -230,11 +236,16 @@ void operate(int sd) {
         // free(input);
         if (strcmp(op, "get") == 0) {
             param = strtok(NULL, " ");
-            get(sd, param);
+            get(sd, server_sd, param);
         }
-        else if (strcmp(op, "quit") == 0) {
+        else if(strcmp(op, "quit") == 0) {
+            close(server_sd);
             quit(sd);
             break;
+        }
+        else if(strcmp(op, "put") == 0) {
+            param = strtok(NULL, " ");
+            put(sd, server_sd, param);
         }
         else {
             // new operations in the future
@@ -268,19 +279,68 @@ unsigned int convert(char *st) {
   return (strtoul(st, 0L, 10));
 }
 
+void convertPort(uint16_t port, int *n5, int *n6) {
+    int i = 0;
+    int x = 1;
+    *n5 = 0;
+    *n6 = 0;
+    int temp = 0;
+    for(i = 0; i < 8; i++) {
+        temp = port & x;
+        *n6 = (*n6)|(temp);
+        x = x << 1; 
+    }
+
+    port = port >> 8;
+    x = 1;
+
+    for(i = 8; i < 16; i++){
+        temp = port & x;
+        *n5 = ((*n5)|(temp));
+        x = x << 1; 
+    }
+}
+
+void getIpPort(int sd, char *ip, int *port) {
+    struct sockaddr_in addr;
+    socklen_t len = sizeof(addr);
+
+    getsockname(sd, (struct sockaddr*) &addr, &len);
+
+    sprintf(ip,"%s", inet_ntoa(addr.sin_addr));
+
+    *port = (uint16_t)ntohs(addr.sin_port);
+}
+
+void getPortString(char *str, char *ip, int n5, int n6) {
+    int i = 0;
+    char ip_temp[1024];
+    strcpy(ip_temp, ip);
+
+    for(i = 0; i < strlen(ip); i++){
+        if(ip_temp[i] == '.'){
+            ip_temp[i] = ',';
+        }
+    }
+    sprintf(str, "%s,%d,%d", ip_temp, n5, n6);
+}
 
 /**
  * Run with
  *         ./myftp <SERVER_IP> <SERVER_PORT>
  **/
 int main (int argc, char *argv[]) {
-    int sd;
-    struct sockaddr_in addr;
+    int sd, data_transfer_sd, srvr_data_transfer_sd;
+    int port, data_transfer_port;
+    int n5, n6;
+    struct sockaddr_in addr, data_transfer_addr;
     char *server_ipaddr = argv[1];
     char *server_portn = argv[2];
+    char data_transfer_ip[BUFSIZE+1];
+    char ip[50];
 
     // arguments checking
-    if(argc == 3 && isValidIpAddress(server_ipaddr) && isValidPortNumber(server_portn))
+    if(argc == 3 && isValidPortNumber(server_portn))
     {
         printf("arguments are valid :D\n");
     } else
@@ -290,6 +350,14 @@ int main (int argc, char *argv[]) {
         exit(EXIT_FAILURE);
     }
 
+    //....
+    struct hostent *host;
+    
+    if ((host = gethostbyname(server_ipaddr)) == NULL) {   
+        printf("There is not a server available at %s\n", server_ipaddr);
+        exit(EXIT_FAILURE);
+    }
+    //.....
     // create socket and check for errors
     sd = socket(AF_INET, SOCK_STREAM, 0);
     DEBUG_PRINT(("socket descriptor [sd]: %d\n", sd));
@@ -300,12 +368,12 @@ int main (int argc, char *argv[]) {
     }
 
     // set socket data 
+    addr.sin_family = AF_INET;
     addr.sin_port = htons(convert(server_portn));
     DEBUG_PRINT(("addr.sin_port (without using htons): %u\n", convert(server_portn)));
     DEBUG_PRINT(("addr.sin_port: %u\n", addr.sin_port));
-    addr.sin_addr.s_addr = 0;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_family = AF_INET;
+    addr.sin_addr = *((struct in_addr *)host->h_addr);
+    memset(&(addr.sin_zero), '\0', 8); 
 
     // connect and check for errors
     // remember to use ports > 1024 if not, a binding error is likely to happen
@@ -324,9 +392,34 @@ int main (int argc, char *argv[]) {
         warn("Hello message not received from server");
     }
     authenticate(sd);
-    operate(sd);
+    // set up connection for data transfer
+    data_transfer_sd = socket(AF_INET, SOCK_STREAM, 0);
 
-    // close socket
+    data_transfer_addr.sin_family = AF_INET;
+    data_transfer_addr.sin_port = htons(0);
+    data_transfer_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    memset(&(data_transfer_addr.sin_zero), '\0', 8);
+
+    bind(data_transfer_sd, (struct sockaddr*) &data_transfer_addr, sizeof(data_transfer_addr));
+    listen(data_transfer_sd, BACKLOG);
+
+    getIpPort(sd, ip, (int *) &port);
+    getIpPort(data_transfer_sd, data_transfer_ip, (int *) &data_transfer_port);
+
+    convertPort(data_transfer_port, &n5, &n6);
+    getPortString(data_transfer_ip, ip, n5, n6);
+    DEBUG_PRINT(("data_transfer_ip %s \n", data_transfer_ip));
+
+    send_msg(sd, "PORT", data_transfer_ip);
+    bzero(data_transfer_ip, (int)sizeof(data_transfer_ip));
+
+    srvr_data_transfer_sd = accept(data_transfer_sd, (struct sockaddr*) NULL, NULL);
+
+    DEBUG_PRINT(("srvr_data_transfer_sd %d \n", srvr_data_transfer_sd));
+    operate(sd, srvr_data_transfer_sd);
+
+    // close sockets
+    close(srvr_data_transfer_sd);
     close(sd);
 
     return 0;
